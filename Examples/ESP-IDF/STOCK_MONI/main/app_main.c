@@ -41,6 +41,8 @@ static bool               g_scan_failed = false;
 static uint32_t           g_scan_start_tick = 0;
 static int                g_selected_ap = -1;
 static char               g_password[64] = "";
+static int                g_state = 0;            /* 0=LIST 1=PWD 2=CONNECTING 3=SUCCESS 4=FAILURE */
+static bool               g_scan_populated = false;
 
 /* ============================ LVGL 屏幕 ================================== */
 static lv_obj_t *scr_wifi_list = NULL;
@@ -67,6 +69,12 @@ static lv_obj_t *wifi_fail = NULL;
 static lv_obj_t *wifi_title = NULL;
 
 /* ============================ LED ======================================== */
+enum { LED_OFF, LED_BLINK_BLUE, LED_BLINK_RED_3, LED_SOLID_RED, LED_BLINK_GREEN_3, LED_SOLID_GREEN };
+static int      g_led_state = LED_OFF;
+static uint32_t g_led_last_toggle = 0;
+static int      g_led_blink_cnt = 0;
+static bool     g_led_on = false;
+
 static void led_init(void)
 {
 	gpio_set_direction(LED_RED_GPIO, GPIO_MODE_OUTPUT);
@@ -77,11 +85,71 @@ static void led_init(void)
 	gpio_set_level(LED_BLUE_GPIO, 1);
 }
 
-static void led_set_green(void) {
-	gpio_set_level(LED_RED_GPIO, 1); gpio_set_level(LED_GREEN_GPIO, 0); gpio_set_level(LED_BLUE_GPIO, 1);
+static void led_all_off(void) {
+	gpio_set_level(LED_RED_GPIO, 1); gpio_set_level(LED_GREEN_GPIO, 1); gpio_set_level(LED_BLUE_GPIO, 1);
 }
-static void led_set_red(void) {
-	gpio_set_level(LED_RED_GPIO, 0); gpio_set_level(LED_GREEN_GPIO, 1); gpio_set_level(LED_BLUE_GPIO, 1);
+
+/* 切换指定 LED: on=true→点亮, on=false→熄灭 */
+static void led_set(uint8_t gpio, bool on) {
+	gpio_set_level(gpio, on ? 0 : 1);
+}
+
+/* 非阻塞 LED 状态机, 在 main loop 中每帧调用 */
+static void led_update(void)
+{
+	uint32_t now = xTaskGetTickCount();
+	uint32_t iv;
+
+	switch (g_led_state) {
+	case LED_BLINK_BLUE:
+		iv = pdMS_TO_TICKS(500);
+		if (now - g_led_last_toggle >= iv) {
+			g_led_on = !g_led_on;
+			led_set(LED_BLUE_GPIO, g_led_on);
+			g_led_last_toggle = now;
+		}
+		break;
+
+	case LED_BLINK_RED_3:
+		iv = pdMS_TO_TICKS(300);
+		if (now - g_led_last_toggle >= iv) {
+			g_led_on = !g_led_on;
+			led_set(LED_RED_GPIO, g_led_on);
+			g_led_blink_cnt++;
+			if (g_led_blink_cnt >= 6) {
+				led_set(LED_RED_GPIO, true);
+				g_led_state = LED_SOLID_RED;
+			}
+			g_led_last_toggle = now;
+		}
+		break;
+
+	case LED_BLINK_GREEN_3:
+		iv = pdMS_TO_TICKS(300);
+		if (now - g_led_last_toggle >= iv) {
+			g_led_on = !g_led_on;
+			led_set(LED_GREEN_GPIO, g_led_on);
+			g_led_blink_cnt++;
+			if (g_led_blink_cnt >= 6) {
+				led_set(LED_GREEN_GPIO, true);
+				g_led_state = LED_SOLID_GREEN;
+			}
+			g_led_last_toggle = now;
+		}
+		break;
+
+	default:
+		break;
+	}
+}
+
+/* 触发 LED 状态切换 */
+static void led_start_blink(int state) {
+	g_led_state = state;
+	g_led_blink_cnt = 0;
+	g_led_last_toggle = xTaskGetTickCount();
+	g_led_on = false;
+	led_all_off();
 }
 
 /* ============================ WiFi 事件处理 ============================== */
@@ -193,16 +261,21 @@ static void on_wifi_btn_click(lv_event_t *e)
 }
 
 /* 密码页 / 失败页: Textarea 获得焦点时弹出键盘 */
+static bool g_ta_was_moved = false;
+
 static void on_ta_focused(lv_event_t *e)
 {
 	lv_obj_t *ta = lv_event_get_target(e);
 	lv_obj_t *kb = lv_event_get_user_data(e);
-
-	/* 键盘内容超出屏幕底部时, 将 textarea 往上移 */
 	uint16_t h = lv_display_get_vertical_resolution(lv_obj_get_display(ta));
-	if (lv_obj_get_y(ta) > h / 2) {
+	lv_coord_t ta_bottom = lv_obj_get_y(ta) + lv_obj_get_height(ta);
+
+	/* 如果 textarea 会被键盘挡住, 上移到顶 */
+	if (ta_bottom > (lv_coord_t)h - 150) {
 		lv_obj_set_y(ta, 4);
+		g_ta_was_moved = true;
 	}
+
 	lv_keyboard_set_textarea(kb, ta);
 	lv_obj_clear_flag(kb, LV_OBJ_FLAG_HIDDEN);
 	ESP_LOGI(TAG, "Keyboard shown");
@@ -382,6 +455,19 @@ static void create_connecting_screen(void)
 /*
  * 创建成功页面
  */
+static void on_rescan_click(lv_event_t *e)
+{
+	ESP_LOGI(TAG, "Rescan WiFi clicked");
+	g_ap_count = 0;
+	g_scan_failed = false;
+	g_scan_populated = false;
+	g_state = 0;  /* STATE_LIST */
+	wifi_scan_start();
+	g_scan_start_tick = xTaskGetTickCount();
+	led_start_blink(LED_BLINK_BLUE);
+	lv_scr_load(scr_wifi_list);
+}
+
 static void create_success_screen(void)
 {
 	scr_success = lv_obj_create(NULL);
@@ -390,12 +476,27 @@ static void create_success_screen(void)
 	lv_obj_t *check = lv_label_create(scr_success);
 	lv_label_set_text(check, LV_SYMBOL_OK);
 	lv_obj_set_style_text_color(check, lv_color_hex(0x00FF00), LV_STATE_DEFAULT);
-	lv_obj_align(check, LV_ALIGN_CENTER, 0, -20);
+	lv_obj_align(check, LV_ALIGN_CENTER, 0, -40);
 
 	lv_obj_t *text = lv_label_create(scr_success);
 	lv_label_set_text(text, "Connected!");
 	lv_obj_set_style_text_color(text, lv_color_hex(0x00FF00), LV_STATE_DEFAULT);
-	lv_obj_align(text, LV_ALIGN_CENTER, 0, 40);
+	lv_obj_align(text, LV_ALIGN_CENTER, 0, 10);
+
+	lv_obj_t *btn_rescan = lv_button_create(scr_success);
+	lv_obj_set_size(btn_rescan, 200, 36);
+	lv_obj_align(btn_rescan, LV_ALIGN_CENTER, 0, 60);
+	lv_obj_add_event_cb(btn_rescan, on_rescan_click, LV_EVENT_CLICKED, NULL);
+	lv_obj_t *lbl_rescan = lv_label_create(btn_rescan);
+	lv_label_set_text(lbl_rescan, "Rescan WiFi");
+	lv_obj_center(lbl_rescan);
+
+	lv_obj_t *btn_continue = lv_button_create(scr_success);
+	lv_obj_set_size(btn_continue, 200, 36);
+	lv_obj_align(btn_continue, LV_ALIGN_CENTER, 0, 110);
+	lv_obj_t *lbl_continue = lv_label_create(btn_continue);
+	lv_label_set_text(lbl_continue, "Continue");
+	lv_obj_center(lbl_continue);
 }
 
 /*
@@ -409,19 +510,19 @@ static void create_failure_screen(void)
 	lv_obj_t *cross = lv_label_create(scr_failure);
 	lv_label_set_text(cross, LV_SYMBOL_CLOSE);
 	lv_obj_set_style_text_color(cross, lv_color_hex(0xFF0000), LV_STATE_DEFAULT);
-	lv_obj_align(cross, LV_ALIGN_CENTER, 0, -40);
+	lv_obj_align(cross, LV_ALIGN_CENTER, 0, -70);
 
 	lv_obj_t *text = lv_label_create(scr_failure);
 	lv_label_set_text(text, "Wrong Password");
 	lv_obj_set_style_text_color(text, lv_color_hex(0xFF0000), LV_STATE_DEFAULT);
-	lv_obj_align(text, LV_ALIGN_CENTER, 0, 10);
+	lv_obj_align(text, LV_ALIGN_CENTER, 0, -45);
 
 	/* 重试文本域 */
 	ta_retry = lv_textarea_create(scr_failure);
 	lv_textarea_set_one_line(ta_retry, true);
 	lv_textarea_set_max_length(ta_retry, 63);
 	lv_obj_set_size(ta_retry, 220, 36);
-	lv_obj_align(ta_retry, LV_ALIGN_BOTTOM_MID, 0, -155);
+	lv_obj_align(ta_retry, LV_ALIGN_CENTER, 0, -28);
 	lv_obj_set_style_bg_color(ta_retry, lv_color_white(), LV_STATE_DEFAULT);
 	lv_obj_set_style_text_color(ta_retry, lv_color_black(), LV_STATE_DEFAULT);
 
@@ -469,30 +570,34 @@ void app_main(void)
 	ESP_ERROR_CHECK(lcd_display_brightness_set(75));
 	ESP_ERROR_CHECK(lcd_display_rotate(lvgl_disp, LV_DISPLAY_ROTATION_0));
 
-	/* ---- 创建所有页面 ---- */
+	/* ---- 创建所有页面(需 LVGL 锁) ---- */
+	lvgl_port_lock(-1);
 	create_wifi_list_screen();
 	create_password_screen();
 	create_connecting_screen();
 	create_success_screen();
 	create_failure_screen();
+	lvgl_port_unlock();
 
 	/* ---- WiFi 初始化 + 首次扫描 ---- */
 	wifi_init();
 	wifi_scan_start();
 	g_scan_start_tick = xTaskGetTickCount();
+	led_start_blink(LED_BLINK_BLUE);
 
 	/* ---- 加载 WiFi 列表页 ---- */
 	lv_scr_load(scr_wifi_list);
 	ESP_LOGI(TAG, "Entering main loop");
 
 	/* ---- 页面状态机 ---- */
-	enum { STATE_LIST, STATE_PWD, STATE_CONNECTING, STATE_SUCCESS, STATE_FAILURE } state = STATE_LIST;
-	bool scan_populated = false;
+	g_state = 0;  /* STATE_LIST */
+	g_scan_populated = false;
 
 	while (1) {
 		vTaskDelay(pdMS_TO_TICKS(30));
 
 		/* === Phase 1: 检查 WiFi 事件 (无需 LVGL 锁) === */
+		led_update();
 		bool need_populate = false;
 		bool need_show_fail = false;
 		bool need_connect_success = false;
@@ -500,7 +605,7 @@ void app_main(void)
 		bool need_connect_timeout = false;
 
 		/* WiFi 扫描检查 */
-		if (state == STATE_LIST && !scan_populated && !g_scan_failed) {
+		if (g_state == 0 && !g_scan_populated && !g_scan_failed) {
 			EventBits_t bits = xEventGroupWaitBits(
 				g_wifi_events, WIFI_SCAN_DONE_BIT,
 				pdFALSE, pdFALSE, 0);
@@ -519,7 +624,7 @@ void app_main(void)
 		}
 
 		/* 连接结果检查 */
-		if (state == STATE_CONNECTING) {
+		if (g_state == 2) {
 			EventBits_t bits = xEventGroupWaitBits(
 				g_wifi_events,
 				WIFI_CONNECTED_BIT | WIFI_AUTH_FAIL_BIT,
@@ -541,7 +646,7 @@ void app_main(void)
 		if (has_ui_work && lvgl_port_lock(pdMS_TO_TICKS(5000))) {
 			if (need_populate) {
 				populate_wifi_list();
-				scan_populated = true;
+				g_scan_populated = true;
 				xEventGroupClearBits(g_wifi_events, WIFI_SCAN_DONE_BIT);
 			}
 			if (need_show_fail) {
@@ -550,24 +655,26 @@ void app_main(void)
 			}
 			if (need_connect_success) {
 				xEventGroupClearBits(g_wifi_events, WIFI_CONNECTED_BIT);
-				led_set_green();
+				led_start_blink(LED_BLINK_GREEN_3);
 				lv_scr_load(scr_success);
-				state = STATE_SUCCESS;
+				g_state = 3;
 				ESP_LOGI(TAG, "===== Connected =====");
 			}
 			if (need_connect_fail) {
 				xEventGroupClearBits(g_wifi_events, WIFI_AUTH_FAIL_BIT);
-				led_set_red();
+				led_start_blink(LED_BLINK_RED_3);
+				lv_obj_set_y(ta_retry, 132);  /* 恢复到原始中心位置 */
 				lv_textarea_set_text(ta_retry, "");
 				lv_obj_add_flag(kb_retry, LV_OBJ_FLAG_HIDDEN);
 				lv_scr_load(scr_failure);
-				state = STATE_FAILURE;
+				g_state = 4;
 				ESP_LOGI(TAG, "===== Wrong password =====");
 			}
 			if (need_connect_timeout) {
-				led_set_red();
+				led_start_blink(LED_BLINK_RED_3);
+				lv_obj_set_y(ta_retry, 132);  /* 恢复到原始中心位置 */
 				lv_scr_load(scr_failure);
-				state = STATE_FAILURE;
+				g_state = 4;
 				ESP_LOGW(TAG, "Connection timeout");
 			}
 			lvgl_port_unlock();
@@ -576,17 +683,17 @@ void app_main(void)
 		/* === Phase 3: 检测页面切换 + 触摸 (需要 LVGL 锁) === */
 		if (lvgl_port_lock(0)) {
 			lv_obj_t *active = lv_scr_act();
-			if (active == scr_password && state != STATE_PWD) {
-				state = STATE_PWD;
+			if (active == scr_password && g_state != 1) {
+				g_state = 1;
 				ESP_LOGI(TAG, "--> Password page");
-			} else if (active == scr_connecting && state != STATE_CONNECTING) {
-				state = STATE_CONNECTING;
+			} else if (active == scr_connecting && g_state != 2) {
+				g_state = 2;
 				ESP_LOGI(TAG, "--> Connecting");
-			} else if (active == scr_failure && state != STATE_FAILURE) {
-				state = STATE_FAILURE;
+			} else if (active == scr_failure && g_state != 4) {
+				g_state = 4;
 				ESP_LOGI(TAG, "--> Failure/retry");
-			} else if (active == scr_wifi_list && state != STATE_LIST) {
-				state = STATE_LIST;
+			} else if (active == scr_wifi_list && g_state != 0) {
+				g_state = 0;
 			}
 			lvgl_port_unlock();
 		}
