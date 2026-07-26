@@ -4,7 +4,7 @@
 #include "stdbool.h"
 #include "driver/spi_master.h"
 
-#define LCD_HOST		VSPI_HOST
+#define LCD_HOST		SPI3_HOST
 #define DMA_CHAN		1
 
 #define PIN_NUM_MISO	12

@@ -1,7 +1,3 @@
-set(COMPONENT_SRCS "lcd.c")
-
-set(COMPONENT_ADD_INCLUDEDIRS ". include")
-
-set(COMPONENT_REQUIRES driver)
-
-register_component()
+idf_component_register(SRCS "lcd.c"
+                       INCLUDE_DIRS "." "include"
+                       REQUIRES esp_driver_gpio esp_driver_spi)
