@@ -22,8 +22,10 @@ static uint16_t map(uint16_t n, uint16_t in_min, uint16_t in_max, uint16_t out_m
 
 static void process_coordinates(esp_lcd_touch_handle_t tp, uint16_t *x, uint16_t *y, uint16_t *strength, uint8_t *point_num, uint8_t max_point_num)
 {
-    *x = map(*x, TOUCH_X_RES_MIN, TOUCH_X_RES_MAX, 0, LCD_H_RES);
-    *y = map(*y, TOUCH_Y_RES_MIN, TOUCH_Y_RES_MAX, 0, LCD_V_RES);
+	uint16_t raw_x = *x, raw_y = *y;
+	*x = map(*x, TOUCH_X_RES_MIN, TOUCH_X_RES_MAX, 0, LCD_H_RES);
+	*y = map(*y, TOUCH_Y_RES_MIN, TOUCH_Y_RES_MAX, 0, LCD_V_RES);
+	ESP_LOGI("touch", "raw(%d,%d) -> screen(%d,%d)", raw_x, raw_y, *x, *y);
 }
 
 esp_err_t touch_init(esp_lcd_touch_handle_t *tp)
