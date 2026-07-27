@@ -49,6 +49,25 @@ static int                g_state = 0;            /* 0=LIST 1=PWD 2=CONNECTING 3
 static bool               g_scan_populated = false;
 static bool               g_ping_pending = false; /* main loop 中执行 ping */
 
+/* ============================ 股票数据 =================================== */
+#define STOCK_CODE "sh688008"
+#define STOCK_NAME "LanChip"
+#define KLINE_MAX  180
+
+typedef struct { float o, c, h, l; } kline_t;
+static kline_t g_kline[KLINE_MAX];
+static int     g_kline_count = 0;
+static float   g_price, g_change_pct, g_open, g_prev_close;
+static bool    g_market_open = false;
+static int     g_stock_view = 7;               /* 7/30/180 */
+static int     g_stock_refresh_s = 30;         /* 倒计时秒 */
+static uint32_t g_stock_tick = 0;
+static bool    g_stock_kline_running = false;
+static bool    g_stock_snap_running = false;
+static char    g_stock_buf[32768];              /* HTTP 响应缓冲区 */
+static int     g_stock_buf_len = 0;
+static bool    g_stock_need_ui = false;
+
 /* ============================ LVGL 屏幕 ================================== */
 static lv_obj_t *scr_wifi_list = NULL;
 static lv_obj_t *scr_password  = NULL;
@@ -57,6 +76,15 @@ static lv_obj_t *scr_success   = NULL;
 static lv_obj_t *scr_failure   = NULL;
 static lv_obj_t *scr_ping_ok   = NULL;
 static lv_obj_t *scr_ping_fail = NULL;
+static lv_obj_t *scr_stock     = NULL;
+
+/* 股票页控件 */
+static lv_obj_t     *stock_chart = NULL;
+static lv_chart_series_t *stock_series = NULL;
+static lv_obj_t     *stock_header = NULL;
+static lv_obj_t     *stock_footer = NULL;
+static lv_obj_t     *stock_btn7 = NULL, *stock_btn30 = NULL, *stock_btn180 = NULL;
+static lv_display_t *g_lvgl_disp = NULL;
 
 /* 密码页控件(需要在回调中引用) */
 static lv_obj_t *ta_pwd = NULL;
@@ -332,11 +360,218 @@ static void do_ping(void)
 	esp_http_client_cleanup(client);
 }
 
+/* ============================ 股票数据获取 =============================== */
+
+static esp_err_t stock_http_handler(esp_http_client_event_t *evt)
+{
+	if (evt->event_id == HTTP_EVENT_ON_DATA) {
+		int remain = sizeof(g_stock_buf) - g_stock_buf_len - 1;
+		int copy = evt->data_len < remain ? evt->data_len : remain;
+		if (copy > 0) {
+			memcpy(g_stock_buf + g_stock_buf_len, evt->data, copy);
+			g_stock_buf_len += copy;
+			g_stock_buf[g_stock_buf_len] = '\0';
+		}
+	}
+	return ESP_OK;
+}
+
+/* 解析实时行情(pipe分隔) */
+static void parse_snapshot(const char *body)
+{
+	const char *p = strstr(body, "\"");
+	if (!p) return;
+	p++;
+	char tmp[256]; int idx = 0, fi = 0;
+	while (*p && *p != '"') {
+		if (*p == '~') { tmp[idx] = '\0'; fi++; idx = 0;
+			if (fi == 3) g_price = atof(tmp);
+			if (fi == 4) g_prev_close = atof(tmp);
+			if (fi == 5) g_open = atof(tmp);
+			if (fi == 32) g_change_pct = atof(tmp);
+			if (fi == 40) g_market_open = strstr(tmp, "Open") || strstr(tmp, "open");
+		} else if (idx < 255) tmp[idx++] = *p;
+		p++;
+	}
+	if (g_prev_close > 0 && g_price > 0) g_change_pct = (g_price - g_prev_close) / g_prev_close * 100;
+	ESP_LOGI(TAG, "Snapshot: price=%.2f open=%.2f prev=%.2f chg=%.2f%%", g_price, g_open, g_prev_close, g_change_pct);
+}
+
+static void fetch_snapshot(void)
+{
+	g_stock_buf_len = 0; g_stock_buf[0] = '\0';
+	esp_http_client_config_t cfg = {
+		.url = "http://qt.gtimg.cn/q=" STOCK_CODE,
+		.event_handler = stock_http_handler,
+		.timeout_ms = 5000,
+		.buffer_size = 2048,
+	};
+	esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+	esp_err_t err = esp_http_client_perform(cli);
+	if (err == ESP_OK) parse_snapshot(g_stock_buf);
+	esp_http_client_cleanup(cli);
+}
+
+/* 解析 K 线 — 手动提取, 不依赖 cJSON */
+static int parse_kline(void)
+{
+	char *p = strstr(g_stock_buf, "qfqday\":[");
+	if (!p) return 0;
+	p += 9;
+
+	int cnt = 0;
+	while (cnt < KLINE_MAX && *p == '[') {
+		float o = 0, c = 0, h = 0, l = 0;
+		int n = sscanf(p, "[\"%*[^\"]\",\"%f\",\"%f\",\"%f\",\"%f\"", &o, &c, &h, &l);
+		if (n < 4) break;
+		g_kline[cnt].o = o; g_kline[cnt].c = c;
+		g_kline[cnt].h = h; g_kline[cnt].l = l;
+		cnt++;
+		p = strchr(p + 1, '[');
+		if (!p) break;
+	}
+	ESP_LOGI(TAG, "parse_kline: %d records, first close=%.2f last close=%.2f",
+		 cnt, cnt > 0 ? g_kline[0].c : 0.0f, cnt > 0 ? g_kline[cnt-1].c : 0.0f);
+	return cnt;
+}
+
+static void fetch_kline(int days)
+{
+	g_stock_buf_len = 0; g_stock_buf[0] = '\0';
+	char url[128];
+	snprintf(url, sizeof(url), "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=" STOCK_CODE ",day,,,%d,qfq", days > KLINE_MAX ? KLINE_MAX : days);
+	esp_http_client_config_t cfg = {
+		.url = url,
+		.event_handler = stock_http_handler,
+		.timeout_ms = 8000,
+		.buffer_size = 4096,
+	};
+	esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+	esp_http_client_set_redirection(cli);
+	esp_err_t err = esp_http_client_perform(cli);
+	int status = esp_http_client_get_status_code(cli);
+	ESP_LOGI(TAG, "K-line HTTP status=%d, buf len=%d, snippet: %.80s", status, g_stock_buf_len, g_stock_buf);
+	if (err == ESP_OK) {
+		g_kline_count = parse_kline();
+	}
+	esp_http_client_cleanup(cli);
+	ESP_LOGI(TAG, "K-line: %d days fetched", g_kline_count);
+}
+
+/* ============================ 股票页创建 ================================= */
+
+static void stock_update_chart(void)
+{
+	if (g_kline_count == 0 || !stock_series) return;
+	int view = g_stock_view;
+	int start = g_kline_count - view;
+	if (start < 0) start = 0;
+	int n = g_kline_count - start;
+	if (n <= 0 || !stock_series) return;
+
+	lv_chart_set_point_count(stock_chart, n);
+
+	float ymin = 999999, ymax = 0;
+	for (int i = start; i < g_kline_count; i++) {
+		if (g_kline[i].l < ymin) ymin = g_kline[i].l;
+		if (g_kline[i].h > ymax) ymax = g_kline[i].h;
+	}
+	float pad = (ymax - ymin) * 0.05f;
+	lv_chart_set_range(stock_chart, LV_CHART_AXIS_PRIMARY_Y, (int)(ymin - pad), (int)(ymax + pad));
+	lv_chart_set_div_line_count(stock_chart, 4, 0);
+
+	for (int i = 0; i < n; i++)
+		lv_chart_set_next_value(stock_chart, stock_series, (int)g_kline[start + i].c);
+	lv_chart_refresh(stock_chart);
+}
+
+static void stock_update_header(void)
+{
+	if (!stock_header) return;
+	bool up = g_change_pct >= 0;
+	char buf[128];
+	snprintf(buf, sizeof(buf), "%s %s  %.2f  %s%.2f%%  %s",
+		STOCK_CODE, STOCK_NAME, g_price,
+		up ? "\xe2\x96\xb2" : "\xe2\x96\xbc", g_change_pct,
+		g_market_open ? "Open" : "Closed");
+	lv_label_set_text(stock_header, buf);
+	lv_obj_set_style_text_color(stock_header,
+		up ? lv_color_hex(0xFF0000) : lv_color_hex(0x00FF00), LV_STATE_DEFAULT);
+}
+
+static void stock_update_footer(void)
+{
+	if (!stock_footer) return;
+	char buf[64];
+	snprintf(buf, sizeof(buf), "O:%.2f  C:%.2f  Refresh:%ds", g_open, g_price, g_stock_refresh_s);
+	lv_label_set_text(stock_footer, buf);
+}
+
+static void on_stock_btn7(lv_event_t *e)  { g_stock_view = 7;  stock_update_chart(); }
+static void on_stock_btn30(lv_event_t *e) { g_stock_view = 30; stock_update_chart(); }
+static void on_stock_btn180(lv_event_t *e){ g_stock_view = 180; stock_update_chart(); }
+
+static void create_stock_screen(void)
+{
+	scr_stock = lv_obj_create(NULL);
+	lv_obj_set_style_bg_color(scr_stock, lv_color_black(), LV_STATE_DEFAULT);
+
+	/* 左侧按钮 */
+	stock_btn7 = lv_button_create(scr_stock);
+	lv_obj_set_size(stock_btn7, 48, 48);
+	lv_obj_align(stock_btn7, LV_ALIGN_LEFT_MID, 4, -60);
+	lv_obj_add_event_cb(stock_btn7, on_stock_btn7, LV_EVENT_CLICKED, NULL);
+	lv_obj_t *l7 = lv_label_create(stock_btn7); lv_label_set_text(l7, "7"); lv_obj_center(l7);
+
+	stock_btn30 = lv_button_create(scr_stock);
+	lv_obj_set_size(stock_btn30, 48, 48);
+	lv_obj_align(stock_btn30, LV_ALIGN_LEFT_MID, 4, 0);
+	lv_obj_add_event_cb(stock_btn30, on_stock_btn30, LV_EVENT_CLICKED, NULL);
+	lv_obj_t *l30 = lv_label_create(stock_btn30); lv_label_set_text(l30, "30"); lv_obj_center(l30);
+
+	stock_btn180 = lv_button_create(scr_stock);
+	lv_obj_set_size(stock_btn180, 48, 48);
+	lv_obj_align(stock_btn180, LV_ALIGN_LEFT_MID, 4, 60);
+	lv_obj_add_event_cb(stock_btn180, on_stock_btn180, LV_EVENT_CLICKED, NULL);
+	lv_obj_t *l180 = lv_label_create(stock_btn180); lv_label_set_text(l180, "180"); lv_obj_center(l180);
+
+	/* 上部信息栏 */
+	stock_header = lv_label_create(scr_stock);
+	lv_obj_set_style_text_color(stock_header, lv_color_white(), LV_STATE_DEFAULT);
+	lv_obj_align(stock_header, LV_ALIGN_TOP_RIGHT, 0, 4);
+
+	/* 折线图 */
+	stock_chart = lv_chart_create(scr_stock);
+	lv_obj_set_size(stock_chart, 250, 180);
+	lv_obj_align(stock_chart, LV_ALIGN_RIGHT_MID, 0, 12);
+	lv_chart_set_type(stock_chart, LV_CHART_TYPE_LINE);
+	lv_obj_set_style_bg_color(stock_chart, lv_color_black(), LV_STATE_DEFAULT);
+	lv_obj_set_style_border_width(stock_chart, 0, LV_STATE_DEFAULT);
+	lv_chart_set_range(stock_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
+	lv_obj_set_style_line_color(stock_chart, lv_color_hex(0x00AAFF), LV_PART_ITEMS);
+	stock_series = lv_chart_add_series(stock_chart, lv_color_hex(0x00AAFF), LV_CHART_AXIS_PRIMARY_Y);
+
+	/* 底部信息栏 */
+	stock_footer = lv_label_create(scr_stock);
+	lv_obj_set_style_text_color(stock_footer, lv_color_white(), LV_STATE_DEFAULT);
+	lv_obj_align(stock_footer, LV_ALIGN_BOTTOM_RIGHT, 0, -4);
+}
+
 static void on_continue_click(lv_event_t *e)
 {
-	ESP_LOGI(TAG, "Continue clicked, starting ping...");
-	g_state = 5;
-	g_ping_pending = true;
+	if (g_state == 3) { /* Connected -> ping */
+		ESP_LOGI(TAG, "Continue: starting ping...");
+		g_state = 5;
+		g_ping_pending = true;
+	} else if (g_state == 6) { /* Ping OK -> stock */
+		ESP_LOGI(TAG, "Continue: entering stock page...");
+		g_state = 8;
+		lcd_display_rotate(g_lvgl_disp, LV_DISPLAY_ROTATION_90);
+		lv_scr_load(scr_stock);
+		g_stock_kline_running = true;
+		g_stock_refresh_s = 30;
+		g_stock_tick = xTaskGetTickCount();
+	}
 }
 
 static void on_reping_click(lv_event_t *e)
@@ -497,6 +732,7 @@ static void create_connecting_screen(void)
 static void on_rescan_click(lv_event_t *e)
 {
 	ESP_LOGI(TAG, "Rescan WiFi clicked");
+	if (g_state >= 8) lcd_display_rotate(g_lvgl_disp, LV_DISPLAY_ROTATION_0);
 	g_ap_count = 0;
 	g_scan_failed = false;
 	g_scan_populated = false;
@@ -569,6 +805,7 @@ static void create_ping_ok_screen(void)
 	lv_obj_t *btn_cont = lv_button_create(scr_ping_ok);
 	lv_obj_set_size(btn_cont, 200, 36);
 	lv_obj_align(btn_cont, LV_ALIGN_CENTER, 0, 110);
+	lv_obj_add_event_cb(btn_cont, on_continue_click, LV_EVENT_CLICKED, NULL);
 	lv_obj_t *lbl_cont = lv_label_create(btn_cont);
 	lv_label_set_text(lbl_cont, "Continue");
 	lv_obj_center(lbl_cont);
@@ -669,6 +906,7 @@ void app_main(void)
 	ESP_ERROR_CHECK(lcd_display_brightness_init());
 	ESP_ERROR_CHECK(app_lcd_init(&lcd_io, &lcd_panel));
 	lv_display_t *lvgl_disp = app_lvgl_init(lcd_io, lcd_panel);
+	g_lvgl_disp = lvgl_disp;
 	if (!lvgl_disp) { ESP_LOGE(TAG, "LVGL init failed!"); esp_restart(); }
 
 	ESP_ERROR_CHECK(touch_init(&tp));
@@ -687,6 +925,7 @@ void app_main(void)
 	create_failure_screen();
 	create_ping_ok_screen();
 	create_ping_fail_screen();
+	create_stock_screen();
 	lvgl_port_unlock();
 
 	/* ---- WiFi 初始化 + 首次扫描 ---- */
@@ -712,6 +951,28 @@ void app_main(void)
 		if (g_ping_pending) {
 			g_ping_pending = false;
 			do_ping();
+		}
+
+		/* 股票数据获取(无锁) */
+		if (g_stock_kline_running) {
+			g_stock_kline_running = false;
+			fetch_kline(KLINE_MAX);
+			g_stock_need_ui = true;
+		}
+		if (g_stock_snap_running) {
+			g_stock_snap_running = false;
+			fetch_snapshot();
+			g_stock_need_ui = true;
+		}
+
+		/* 股票刷新倒计时(仅stock页) */
+		if (g_state == 8 && (xTaskGetTickCount() - g_stock_tick) >= pdMS_TO_TICKS(1000)) {
+			g_stock_tick = xTaskGetTickCount();
+			g_stock_refresh_s--;
+			if (g_stock_refresh_s <= 0) {
+				g_stock_refresh_s = 30;
+				g_stock_snap_running = true;
+			}
 		}
 
 		bool need_populate = false;
@@ -768,7 +1029,8 @@ void app_main(void)
 		/* === Phase 2: 应用 UI 变更 (需要 LVGL 锁) === */
 		bool has_ui_work = need_populate || need_show_fail ||
 				   need_connect_success || need_connect_fail ||
-				   need_ping_ok || need_ping_fail;
+				   need_ping_ok || need_ping_fail ||
+				   g_stock_need_ui;
 
 		if (has_ui_work && lvgl_port_lock(pdMS_TO_TICKS(5000))) {
 			if (need_populate) {
@@ -810,11 +1072,18 @@ void app_main(void)
 				g_state = 7;
 				ESP_LOGI(TAG, "===== Ping Failed =====");
 			}
+			/* 股票页更新 */
+			if (g_state == 8 && g_stock_need_ui) {
+				stock_update_chart();
+				stock_update_header();
+				stock_update_footer();
+				g_stock_need_ui = false;
+			}
 			lvgl_port_unlock();
 		}
 
 		/* === Phase 3: 检测页面切换 + 触摸 (需要 LVGL 锁) === */
-		if (g_state != 5 && lvgl_port_lock(0)) {
+		if (g_state != 5 && g_state != 8 && lvgl_port_lock(0)) {
 			lv_obj_t *active = lv_scr_act();
 			if (active == scr_password && g_state != 1) {
 				g_state = 1;
