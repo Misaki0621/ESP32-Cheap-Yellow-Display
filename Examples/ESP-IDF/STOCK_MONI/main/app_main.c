@@ -53,8 +53,10 @@ static bool               g_ping_pending = false; /* main loop 中执行 ping */
 /* ============================ 股票数据 =================================== */
 typedef struct { const char *code; const char *name; const char *sina; } stock_info_t;
 static stock_info_t g_stocks[] = {
-	{"sh688008", "688008", NULL},   /* 澜起科技 A股 */
-	{"usNDX",    "NDX",    ".ndx"}, /* 纳斯达克100 美股 */
+	{"sh688008", "688008", NULL},     /* 澜起科技 A股 */
+	{"sh600036", "600036", NULL},     /* 招商银行 A股 */
+	{"usNDX",    "NDX",    ".ndx"},   /* 纳斯达克100 美股 */
+	{"us.INX",   "SPX",    ".inx"},   /* 标普500 美股 */
 };
 static int      g_stock_idx = 0;           /* 当前股票索引 */
 #define KLINE_MAX  180
