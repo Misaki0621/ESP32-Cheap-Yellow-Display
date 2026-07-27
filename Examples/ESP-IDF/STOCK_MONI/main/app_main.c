@@ -261,21 +261,10 @@ static void on_wifi_btn_click(lv_event_t *e)
 }
 
 /* 密码页 / 失败页: Textarea 获得焦点时弹出键盘 */
-static bool g_ta_was_moved = false;
-
 static void on_ta_focused(lv_event_t *e)
 {
 	lv_obj_t *ta = lv_event_get_target(e);
 	lv_obj_t *kb = lv_event_get_user_data(e);
-	uint16_t h = lv_display_get_vertical_resolution(lv_obj_get_display(ta));
-	lv_coord_t ta_bottom = lv_obj_get_y(ta) + lv_obj_get_height(ta);
-
-	/* 如果 textarea 会被键盘挡住, 上移到顶 */
-	if (ta_bottom > (lv_coord_t)h - 150) {
-		lv_obj_set_y(ta, 4);
-		g_ta_was_moved = true;
-	}
-
 	lv_keyboard_set_textarea(kb, ta);
 	lv_obj_clear_flag(kb, LV_OBJ_FLAG_HIDDEN);
 	ESP_LOGI(TAG, "Keyboard shown");
@@ -291,11 +280,11 @@ static void on_ta_ready(lv_event_t *e)
 
 	if (g_selected_ap >= 0 && g_selected_ap < g_ap_count) {
 		wifi_try_connect((char *)g_ap_list[g_selected_ap].ssid, g_password);
+		lv_scr_load(scr_connecting);
+		ESP_LOGI(TAG, "Switching to connecting page");
 	} else {
 		ESP_LOGW(TAG, "No AP selected");
 	}
-	lv_scr_load(scr_connecting);
-	ESP_LOGI(TAG, "Switching to connecting page");
 }
 
 /* 密码/重试 textarea: 键盘按下取消 */
@@ -461,7 +450,11 @@ static void on_rescan_click(lv_event_t *e)
 	g_ap_count = 0;
 	g_scan_failed = false;
 	g_scan_populated = false;
-	g_state = 0;  /* STATE_LIST */
+	g_selected_ap = -1;
+	g_state = 0;
+	lv_obj_clear_flag(wifi_hint, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_add_flag(wifi_container, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_add_flag(wifi_fail, LV_OBJ_FLAG_HIDDEN);
 	wifi_scan_start();
 	g_scan_start_tick = xTaskGetTickCount();
 	led_start_blink(LED_BLINK_BLUE);
@@ -522,7 +515,7 @@ static void create_failure_screen(void)
 	lv_textarea_set_one_line(ta_retry, true);
 	lv_textarea_set_max_length(ta_retry, 63);
 	lv_obj_set_size(ta_retry, 220, 36);
-	lv_obj_align(ta_retry, LV_ALIGN_CENTER, 0, -28);
+	lv_obj_align(ta_retry, LV_ALIGN_CENTER, 0, -16);
 	lv_obj_set_style_bg_color(ta_retry, lv_color_white(), LV_STATE_DEFAULT);
 	lv_obj_set_style_text_color(ta_retry, lv_color_black(), LV_STATE_DEFAULT);
 
@@ -602,7 +595,6 @@ void app_main(void)
 		bool need_show_fail = false;
 		bool need_connect_success = false;
 		bool need_connect_fail = false;
-		bool need_connect_timeout = false;
 
 		/* WiFi 扫描检查 */
 		if (g_state == 0 && !g_scan_populated && !g_scan_failed) {
@@ -633,15 +625,12 @@ void app_main(void)
 				need_connect_success = true;
 			} else if (bits & WIFI_AUTH_FAIL_BIT) {
 				need_connect_fail = true;
-			} else if ((xTaskGetTickCount() - g_connect_tick) > pdMS_TO_TICKS(15000)) {
-				need_connect_timeout = true;
 			}
 		}
 
 		/* === Phase 2: 应用 UI 变更 (需要 LVGL 锁) === */
 		bool has_ui_work = need_populate || need_show_fail ||
-				   need_connect_success || need_connect_fail ||
-				   need_connect_timeout;
+				   need_connect_success || need_connect_fail;
 
 		if (has_ui_work && lvgl_port_lock(pdMS_TO_TICKS(5000))) {
 			if (need_populate) {
@@ -663,19 +652,11 @@ void app_main(void)
 			if (need_connect_fail) {
 				xEventGroupClearBits(g_wifi_events, WIFI_AUTH_FAIL_BIT);
 				led_start_blink(LED_BLINK_RED_3);
-				lv_obj_set_y(ta_retry, 132);  /* 恢复到原始中心位置 */
 				lv_textarea_set_text(ta_retry, "");
 				lv_obj_add_flag(kb_retry, LV_OBJ_FLAG_HIDDEN);
 				lv_scr_load(scr_failure);
 				g_state = 4;
 				ESP_LOGI(TAG, "===== Wrong password =====");
-			}
-			if (need_connect_timeout) {
-				led_start_blink(LED_BLINK_RED_3);
-				lv_obj_set_y(ta_retry, 132);  /* 恢复到原始中心位置 */
-				lv_scr_load(scr_failure);
-				g_state = 4;
-				ESP_LOGW(TAG, "Connection timeout");
 			}
 			lvgl_port_unlock();
 		}
