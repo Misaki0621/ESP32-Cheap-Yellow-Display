@@ -18,6 +18,7 @@
 #include "lvgl.h"
 #include "esp_lvgl_port.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "lcd.h"
 #include "touch.h"
 
@@ -84,6 +85,8 @@ static lv_chart_series_t *stock_series = NULL;
 static lv_obj_t     *stock_header = NULL;
 static lv_obj_t     *stock_footer = NULL;
 static lv_obj_t     *stock_btn7 = NULL, *stock_btn30 = NULL, *stock_btn180 = NULL;
+static lv_obj_t     *stock_ylabels[4];  /* Y 轴 4 个标签 */
+static lv_obj_t     *stock_xlabels[10]; /* X 轴最多 10 个标签 */
 static lv_display_t *g_lvgl_disp = NULL;
 
 /* 密码页控件(需要在回调中引用) */
@@ -385,15 +388,14 @@ static void parse_snapshot(const char *body)
 	char tmp[256]; int idx = 0, fi = 0;
 	while (*p && *p != '"') {
 		if (*p == '~') { tmp[idx] = '\0'; fi++; idx = 0;
-			if (fi == 3) g_price = atof(tmp);
-			if (fi == 4) g_prev_close = atof(tmp);
-			if (fi == 5) g_open = atof(tmp);
-			if (fi == 32) g_change_pct = atof(tmp);
-			if (fi == 40) g_market_open = strstr(tmp, "Open") || strstr(tmp, "open");
+			if (fi == 4) g_price = atof(tmp);         /* field 4 = latest price */
+			if (fi == 5) g_prev_close = atof(tmp);     /* field 5 = prev close */
+			if (fi == 6) g_open = atof(tmp);           /* field 6 = open */
+			if (fi == 33) g_change_pct = atof(tmp);    /* field 33 = change % */
+			if (fi == 41) g_market_open = strstr(tmp, "Open") || strstr(tmp, "open");
 		} else if (idx < 255) tmp[idx++] = *p;
 		p++;
 	}
-	if (g_prev_close > 0 && g_price > 0) g_change_pct = (g_price - g_prev_close) / g_prev_close * 100;
 	ESP_LOGI(TAG, "Snapshot: price=%.2f open=%.2f prev=%.2f chg=%.2f%%", g_price, g_open, g_prev_close, g_change_pct);
 }
 
@@ -422,8 +424,13 @@ static int parse_kline(void)
 	int cnt = 0;
 	while (cnt < KLINE_MAX && *p == '[') {
 		float o = 0, c = 0, h = 0, l = 0;
-		int n = sscanf(p, "[\"%*[^\"]\",\"%f\",\"%f\",\"%f\",\"%f\"", &o, &c, &h, &l);
-		if (n < 4) break;
+		/* 复制一行到临时缓冲区, 替换引号/逗号为空格便于 sscanf */
+		char line[128]; int li = 0;
+		while (*p && *p != ']' && li < 127) line[li++] = *p++;
+		line[li] = '\0';
+		for (int i = 0; i < li; i++) if (line[i] == '"' || line[i] == ',') line[i] = ' ';
+		sscanf(line, "[ %*s %f %f %f %f", &o, &c, &h, &l);
+		ESP_LOGI(TAG, "  parsed[%d] o=%.2f c=%.2f h=%.2f l=%.2f", cnt, o, c, h, l);
 		g_kline[cnt].o = o; g_kline[cnt].c = c;
 		g_kline[cnt].h = h; g_kline[cnt].l = l;
 		cnt++;
@@ -439,15 +446,16 @@ static void fetch_kline(int days)
 {
 	g_stock_buf_len = 0; g_stock_buf[0] = '\0';
 	char url[128];
-	snprintf(url, sizeof(url), "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=" STOCK_CODE ",day,,,%d,qfq", days > KLINE_MAX ? KLINE_MAX : days);
+	snprintf(url, sizeof(url), "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=" STOCK_CODE ",day,,,%d,qfq", days > KLINE_MAX ? KLINE_MAX : days);
 	esp_http_client_config_t cfg = {
 		.url = url,
 		.event_handler = stock_http_handler,
 		.timeout_ms = 8000,
 		.buffer_size = 4096,
+		.crt_bundle_attach = esp_crt_bundle_attach,
 	};
 	esp_http_client_handle_t cli = esp_http_client_init(&cfg);
-	esp_http_client_set_redirection(cli);
+	esp_http_client_set_header(cli, "User-Agent", "Mozilla/5.0");
 	esp_err_t err = esp_http_client_perform(cli);
 	int status = esp_http_client_get_status_code(cli);
 	ESP_LOGI(TAG, "K-line HTTP status=%d, buf len=%d, snippet: %.80s", status, g_stock_buf_len, g_stock_buf);
@@ -467,22 +475,45 @@ static void stock_update_chart(void)
 	int start = g_kline_count - view;
 	if (start < 0) start = 0;
 	int n = g_kline_count - start;
-	if (n <= 0 || !stock_series) return;
+	if (n <= 0) return;
 
-	lv_chart_set_point_count(stock_chart, n);
+	/* 追加当前实时价格作为额外数据点 */
+	int total = n + 1;
+	float extra_close = g_price > 0 ? g_price : g_kline[g_kline_count-1].c;
+	float extra_high  = g_price > g_kline[g_kline_count-1].h ? g_price : g_kline[g_kline_count-1].h;
+	float extra_low   = g_price < g_kline[g_kline_count-1].l ? g_price : g_kline[g_kline_count-1].l;
 
 	float ymin = 999999, ymax = 0;
 	for (int i = start; i < g_kline_count; i++) {
 		if (g_kline[i].l < ymin) ymin = g_kline[i].l;
 		if (g_kline[i].h > ymax) ymax = g_kline[i].h;
 	}
+	if (extra_low < ymin) ymin = extra_low;
+	if (extra_high > ymax) ymax = extra_high;
+
 	float pad = (ymax - ymin) * 0.05f;
+	lv_chart_set_point_count(stock_chart, total);
 	lv_chart_set_range(stock_chart, LV_CHART_AXIS_PRIMARY_Y, (int)(ymin - pad), (int)(ymax + pad));
-	lv_chart_set_div_line_count(stock_chart, 4, 0);
+	lv_chart_set_div_line_count(stock_chart, 3, (total <= 8) ? (total - 1) : 9);
 
 	for (int i = 0; i < n; i++)
 		lv_chart_set_next_value(stock_chart, stock_series, (int)g_kline[start + i].c);
+	lv_chart_set_next_value(stock_chart, stock_series, (int)extra_close);
 	lv_chart_refresh(stock_chart);
+
+	ESP_LOGI(TAG, "chart: view=%d data=%d total=%d price=%.2f extra=%.2f", view, n, total, g_price, extra_close);
+
+	/* 更新 Y 轴标签(从上到下: 高→低, 对齐 chart 网格线) */
+	char buf[16];
+	float yrange = (ymax - ymin) * 1.05f + 1;
+	for (int i = 0; i < 4; i++) {
+		snprintf(buf, sizeof(buf), "%.0f", ymin + yrange * (3 - i) / 3);
+		lv_label_set_text(stock_ylabels[i], buf);
+		lv_obj_align_to(stock_ylabels[i], stock_chart, LV_ALIGN_OUT_LEFT_MID, 10, -80 + i * 53);
+	}
+	/* 隐藏所有 X 轴标签 */
+	for (int i = 0; i < 10; i++)
+		lv_obj_add_flag(stock_xlabels[i], LV_OBJ_FLAG_HIDDEN);
 }
 
 static void stock_update_header(void)
@@ -490,9 +521,9 @@ static void stock_update_header(void)
 	if (!stock_header) return;
 	bool up = g_change_pct >= 0;
 	char buf[128];
-	snprintf(buf, sizeof(buf), "%s %s  %.2f  %s%.2f%%  %s",
-		STOCK_CODE, STOCK_NAME, g_price,
-		up ? "\xe2\x96\xb2" : "\xe2\x96\xbc", g_change_pct,
+	snprintf(buf, sizeof(buf), "%s  %.2f  %s%.2f%%  %s",
+		STOCK_CODE, g_price,
+		up ? "^" : "v", g_change_pct,
 		g_market_open ? "Open" : "Closed");
 	lv_label_set_text(stock_header, buf);
 	lv_obj_set_style_text_color(stock_header,
@@ -551,6 +582,21 @@ static void create_stock_screen(void)
 	lv_obj_set_style_line_color(stock_chart, lv_color_hex(0x00AAFF), LV_PART_ITEMS);
 	stock_series = lv_chart_add_series(stock_chart, lv_color_hex(0x00AAFF), LV_CHART_AXIS_PRIMARY_Y);
 
+	/* Y 轴标签(左侧) */
+	for (int i = 0; i < 4; i++) {
+		stock_ylabels[i] = lv_label_create(scr_stock);
+		lv_obj_set_style_text_color(stock_ylabels[i], lv_color_white(), LV_STATE_DEFAULT);
+		lv_obj_set_style_text_font(stock_ylabels[i], &lv_font_montserrat_14, LV_STATE_DEFAULT);
+		lv_obj_align(stock_ylabels[i], LV_ALIGN_LEFT_MID, 56, -70 + i * 45);
+	}
+	/* X 轴标签(底部) */
+	for (int i = 0; i < 10; i++) {
+		stock_xlabels[i] = lv_label_create(scr_stock);
+		lv_obj_set_style_text_color(stock_xlabels[i], lv_color_white(), LV_STATE_DEFAULT);
+		lv_obj_set_style_text_font(stock_xlabels[i], &lv_font_montserrat_14, LV_STATE_DEFAULT);
+		lv_obj_add_flag(stock_xlabels[i], LV_OBJ_FLAG_HIDDEN);
+	}
+
 	/* 底部信息栏 */
 	stock_footer = lv_label_create(scr_stock);
 	lv_obj_set_style_text_color(stock_footer, lv_color_white(), LV_STATE_DEFAULT);
@@ -569,6 +615,7 @@ static void on_continue_click(lv_event_t *e)
 		lcd_display_rotate(g_lvgl_disp, LV_DISPLAY_ROTATION_90);
 		lv_scr_load(scr_stock);
 		g_stock_kline_running = true;
+		g_stock_snap_running = true;
 		g_stock_refresh_s = 30;
 		g_stock_tick = xTaskGetTickCount();
 	}
@@ -969,6 +1016,7 @@ void app_main(void)
 		if (g_state == 8 && (xTaskGetTickCount() - g_stock_tick) >= pdMS_TO_TICKS(1000)) {
 			g_stock_tick = xTaskGetTickCount();
 			g_stock_refresh_s--;
+			g_stock_need_ui = true;
 			if (g_stock_refresh_s <= 0) {
 				g_stock_refresh_s = 30;
 				g_stock_snap_running = true;
@@ -1074,9 +1122,10 @@ void app_main(void)
 			}
 			/* 股票页更新 */
 			if (g_state == 8 && g_stock_need_ui) {
-				stock_update_chart();
 				stock_update_header();
 				stock_update_footer();
+				if (g_kline_count > 0 && !g_stock_snap_running && !g_stock_kline_running)
+					stock_update_chart();
 				g_stock_need_ui = false;
 			}
 			lvgl_port_unlock();
