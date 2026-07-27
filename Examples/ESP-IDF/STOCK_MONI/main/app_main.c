@@ -17,6 +17,7 @@
 #include "esp_lcd_touch.h"
 #include "lvgl.h"
 #include "esp_lvgl_port.h"
+#include "esp_http_client.h"
 #include "lcd.h"
 #include "touch.h"
 
@@ -31,9 +32,12 @@ static const char *TAG = "stock_moni";
 #define WIFI_SCAN_DONE_BIT   BIT0
 #define WIFI_CONNECTED_BIT   BIT1
 #define WIFI_AUTH_FAIL_BIT   BIT2
+#define PING_OK_BIT          BIT3
+#define PING_FAIL_BIT        BIT4
 
 /* ============================ 全局状态 ================================== */
 static EventGroupHandle_t g_wifi_events = NULL;
+static EventGroupHandle_t g_ping_events = NULL;
 static wifi_ap_record_t   g_ap_list[10];
 static uint16_t           g_ap_count = 0;
 static uint32_t           g_connect_tick = 0;
@@ -43,6 +47,7 @@ static int                g_selected_ap = -1;
 static char               g_password[64] = "";
 static int                g_state = 0;            /* 0=LIST 1=PWD 2=CONNECTING 3=SUCCESS 4=FAILURE */
 static bool               g_scan_populated = false;
+static bool               g_ping_pending = false; /* main loop 中执行 ping */
 
 /* ============================ LVGL 屏幕 ================================== */
 static lv_obj_t *scr_wifi_list = NULL;
@@ -50,6 +55,8 @@ static lv_obj_t *scr_password  = NULL;
 static lv_obj_t *scr_connecting = NULL;
 static lv_obj_t *scr_success   = NULL;
 static lv_obj_t *scr_failure   = NULL;
+static lv_obj_t *scr_ping_ok   = NULL;
+static lv_obj_t *scr_ping_fail = NULL;
 
 /* 密码页控件(需要在回调中引用) */
 static lv_obj_t *ta_pwd = NULL;
@@ -295,6 +302,49 @@ static void on_ta_cancel(lv_event_t *e)
 	ESP_LOGI(TAG, "Keyboard hidden");
 }
 
+/* ============================ Ping 功能 ================================== */
+
+static esp_err_t ping_http_event_handler(esp_http_client_event_t *evt)
+{
+	if (evt->event_id == HTTP_EVENT_ON_DATA || evt->event_id == HTTP_EVENT_ON_FINISH) {
+		xEventGroupSetBits(g_ping_events, PING_OK_BIT);
+	}
+	return ESP_OK;
+}
+
+static void do_ping(void)
+{
+	ESP_LOGI(TAG, "Pinging qt.gtimg.cn...");
+	xEventGroupClearBits(g_ping_events, PING_OK_BIT | PING_FAIL_BIT);
+
+	esp_http_client_config_t cfg = {
+		.url = "http://qt.gtimg.cn/",
+		.event_handler = ping_http_event_handler,
+		.timeout_ms = 5000,
+	};
+	esp_http_client_handle_t client = esp_http_client_init(&cfg);
+	esp_err_t err = esp_http_client_perform(client);
+
+	if (err != ESP_OK) {
+		ESP_LOGW(TAG, "Ping failed: %s", esp_err_to_name(err));
+		xEventGroupSetBits(g_ping_events, PING_FAIL_BIT);
+	}
+	esp_http_client_cleanup(client);
+}
+
+static void on_continue_click(lv_event_t *e)
+{
+	ESP_LOGI(TAG, "Continue clicked, starting ping...");
+	g_state = 5;
+	g_ping_pending = true;
+}
+
+static void on_reping_click(lv_event_t *e)
+{
+	ESP_LOGI(TAG, "Re-ping clicked");
+	g_ping_pending = true;
+}
+
 /* ============================ 页面创建函数 ============================== */
 
 /*
@@ -487,9 +537,73 @@ static void create_success_screen(void)
 	lv_obj_t *btn_continue = lv_button_create(scr_success);
 	lv_obj_set_size(btn_continue, 200, 36);
 	lv_obj_align(btn_continue, LV_ALIGN_CENTER, 0, 110);
+	lv_obj_add_event_cb(btn_continue, on_continue_click, LV_EVENT_CLICKED, NULL);
 	lv_obj_t *lbl_continue = lv_label_create(btn_continue);
 	lv_label_set_text(lbl_continue, "Continue");
 	lv_obj_center(lbl_continue);
+}
+
+static void create_ping_ok_screen(void)
+{
+	scr_ping_ok = lv_obj_create(NULL);
+	lv_obj_set_style_bg_color(scr_ping_ok, lv_color_black(), LV_STATE_DEFAULT);
+
+	lv_obj_t *check = lv_label_create(scr_ping_ok);
+	lv_label_set_text(check, LV_SYMBOL_OK);
+	lv_obj_set_style_text_color(check, lv_color_hex(0x00FF00), LV_STATE_DEFAULT);
+	lv_obj_align(check, LV_ALIGN_CENTER, 0, -40);
+
+	lv_obj_t *text = lv_label_create(scr_ping_ok);
+	lv_label_set_text(text, "Ping OK");
+	lv_obj_set_style_text_color(text, lv_color_hex(0x00FF00), LV_STATE_DEFAULT);
+	lv_obj_align(text, LV_ALIGN_CENTER, 0, 10);
+
+	lv_obj_t *btn_rescan = lv_button_create(scr_ping_ok);
+	lv_obj_set_size(btn_rescan, 200, 36);
+	lv_obj_align(btn_rescan, LV_ALIGN_CENTER, 0, 60);
+	lv_obj_add_event_cb(btn_rescan, on_rescan_click, LV_EVENT_CLICKED, NULL);
+	lv_obj_t *lbl_rescan = lv_label_create(btn_rescan);
+	lv_label_set_text(lbl_rescan, "Rescan WiFi");
+	lv_obj_center(lbl_rescan);
+
+	lv_obj_t *btn_cont = lv_button_create(scr_ping_ok);
+	lv_obj_set_size(btn_cont, 200, 36);
+	lv_obj_align(btn_cont, LV_ALIGN_CENTER, 0, 110);
+	lv_obj_t *lbl_cont = lv_label_create(btn_cont);
+	lv_label_set_text(lbl_cont, "Continue");
+	lv_obj_center(lbl_cont);
+}
+
+static void create_ping_fail_screen(void)
+{
+	scr_ping_fail = lv_obj_create(NULL);
+	lv_obj_set_style_bg_color(scr_ping_fail, lv_color_black(), LV_STATE_DEFAULT);
+
+	lv_obj_t *cross = lv_label_create(scr_ping_fail);
+	lv_label_set_text(cross, LV_SYMBOL_CLOSE);
+	lv_obj_set_style_text_color(cross, lv_color_hex(0xFF0000), LV_STATE_DEFAULT);
+	lv_obj_align(cross, LV_ALIGN_CENTER, 0, -40);
+
+	lv_obj_t *text = lv_label_create(scr_ping_fail);
+	lv_label_set_text(text, "Ping Failed");
+	lv_obj_set_style_text_color(text, lv_color_hex(0xFF0000), LV_STATE_DEFAULT);
+	lv_obj_align(text, LV_ALIGN_CENTER, 0, 10);
+
+	lv_obj_t *btn_rescan = lv_button_create(scr_ping_fail);
+	lv_obj_set_size(btn_rescan, 200, 36);
+	lv_obj_align(btn_rescan, LV_ALIGN_CENTER, 0, 60);
+	lv_obj_add_event_cb(btn_rescan, on_rescan_click, LV_EVENT_CLICKED, NULL);
+	lv_obj_t *lbl_rescan = lv_label_create(btn_rescan);
+	lv_label_set_text(lbl_rescan, "Rescan WiFi");
+	lv_obj_center(lbl_rescan);
+
+	lv_obj_t *btn_reping = lv_button_create(scr_ping_fail);
+	lv_obj_set_size(btn_reping, 200, 36);
+	lv_obj_align(btn_reping, LV_ALIGN_CENTER, 0, 110);
+	lv_obj_add_event_cb(btn_reping, on_reping_click, LV_EVENT_CLICKED, NULL);
+	lv_obj_t *lbl_reping = lv_label_create(btn_reping);
+	lv_label_set_text(lbl_reping, "Re-ping");
+	lv_obj_center(lbl_reping);
 }
 
 /*
@@ -562,6 +676,7 @@ void app_main(void)
 	lvgl_port_add_touch(&touch_cfg);
 	ESP_ERROR_CHECK(lcd_display_brightness_set(75));
 	ESP_ERROR_CHECK(lcd_display_rotate(lvgl_disp, LV_DISPLAY_ROTATION_0));
+	g_ping_events = xEventGroupCreate();
 
 	/* ---- 创建所有页面(需 LVGL 锁) ---- */
 	lvgl_port_lock(-1);
@@ -570,6 +685,8 @@ void app_main(void)
 	create_connecting_screen();
 	create_success_screen();
 	create_failure_screen();
+	create_ping_ok_screen();
+	create_ping_fail_screen();
 	lvgl_port_unlock();
 
 	/* ---- WiFi 初始化 + 首次扫描 ---- */
@@ -591,6 +708,12 @@ void app_main(void)
 
 		/* === Phase 1: 检查 WiFi 事件 (无需 LVGL 锁) === */
 		led_update();
+
+		if (g_ping_pending) {
+			g_ping_pending = false;
+			do_ping();
+		}
+
 		bool need_populate = false;
 		bool need_show_fail = false;
 		bool need_connect_success = false;
@@ -628,9 +751,24 @@ void app_main(void)
 			}
 		}
 
+		/* Ping 结果检查 */
+		bool need_ping_ok = false;
+		bool need_ping_fail = false;
+		if (g_state == 5) {
+			EventBits_t bits = xEventGroupWaitBits(
+				g_ping_events, PING_OK_BIT | PING_FAIL_BIT,
+				pdFALSE, pdFALSE, 0);
+			if (bits & PING_OK_BIT) {
+				need_ping_ok = true;
+			} else if (bits & PING_FAIL_BIT) {
+				need_ping_fail = true;
+			}
+		}
+
 		/* === Phase 2: 应用 UI 变更 (需要 LVGL 锁) === */
 		bool has_ui_work = need_populate || need_show_fail ||
-				   need_connect_success || need_connect_fail;
+				   need_connect_success || need_connect_fail ||
+				   need_ping_ok || need_ping_fail;
 
 		if (has_ui_work && lvgl_port_lock(pdMS_TO_TICKS(5000))) {
 			if (need_populate) {
@@ -658,11 +796,25 @@ void app_main(void)
 				g_state = 4;
 				ESP_LOGI(TAG, "===== Wrong password =====");
 			}
+			if (need_ping_ok) {
+				xEventGroupClearBits(g_ping_events, PING_OK_BIT);
+				led_start_blink(LED_BLINK_GREEN_3);
+				lv_scr_load(scr_ping_ok);
+				g_state = 6;
+				ESP_LOGI(TAG, "===== Ping OK =====");
+			}
+			if (need_ping_fail) {
+				xEventGroupClearBits(g_ping_events, PING_FAIL_BIT);
+				led_start_blink(LED_BLINK_RED_3);
+				lv_scr_load(scr_ping_fail);
+				g_state = 7;
+				ESP_LOGI(TAG, "===== Ping Failed =====");
+			}
 			lvgl_port_unlock();
 		}
 
 		/* === Phase 3: 检测页面切换 + 触摸 (需要 LVGL 锁) === */
-		if (lvgl_port_lock(0)) {
+		if (g_state != 5 && lvgl_port_lock(0)) {
 			lv_obj_t *active = lv_scr_act();
 			if (active == scr_password && g_state != 1) {
 				g_state = 1;
