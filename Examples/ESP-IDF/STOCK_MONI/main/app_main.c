@@ -51,8 +51,12 @@ static bool               g_scan_populated = false;
 static bool               g_ping_pending = false; /* main loop 中执行 ping */
 
 /* ============================ 股票数据 =================================== */
-#define STOCK_CODE "sh688008"
-#define STOCK_NAME "LanChip"
+typedef struct { const char *code; const char *name; const char *sina; } stock_info_t;
+static stock_info_t g_stocks[] = {
+	{"sh688008", "688008", NULL},   /* 澜起科技 A股 */
+	{"usNDX",    "NDX",    ".ndx"}, /* 纳斯达克100 美股 */
+};
+static int      g_stock_idx = 0;           /* 当前股票索引 */
 #define KLINE_MAX  180
 
 typedef struct { float o, c, h, l; } kline_t;
@@ -61,7 +65,7 @@ static int     g_kline_count = 0;
 static float   g_price, g_change_pct, g_open, g_prev_close;
 static bool    g_market_open = false;
 static int     g_stock_view = 7;               /* 7/30/180 */
-static int     g_stock_refresh_s = 30;         /* 倒计时秒 */
+static int     g_stock_refresh_s = 5;          /* 倒计时秒 */
 static uint32_t g_stock_tick = 0;
 static bool    g_stock_kline_running = false;
 static bool    g_stock_snap_running = false;
@@ -368,13 +372,19 @@ static void do_ping(void)
 static esp_err_t stock_http_handler(esp_http_client_event_t *evt)
 {
 	if (evt->event_id == HTTP_EVENT_ON_DATA) {
-		int remain = sizeof(g_stock_buf) - g_stock_buf_len - 1;
-		int copy = evt->data_len < remain ? evt->data_len : remain;
-		if (copy > 0) {
-			memcpy(g_stock_buf + g_stock_buf_len, evt->data, copy);
-			g_stock_buf_len += copy;
+		int copy = evt->data_len;
+		/* ring buffer: 满时丢弃前半旧数据 */
+		if (g_stock_buf_len + copy > (int)sizeof(g_stock_buf) - 1) {
+			int keep = g_stock_buf_len * 3 / 4;
+			memmove(g_stock_buf, g_stock_buf + g_stock_buf_len - keep, keep);
+			g_stock_buf_len = keep;
 			g_stock_buf[g_stock_buf_len] = '\0';
 		}
+		int remain = sizeof(g_stock_buf) - g_stock_buf_len - 1;
+		if (copy > remain) copy = remain;
+		memcpy(g_stock_buf + g_stock_buf_len, evt->data, copy);
+		g_stock_buf_len += copy;
+		g_stock_buf[g_stock_buf_len] = '\0';
 	}
 	return ESP_OK;
 }
@@ -392,7 +402,8 @@ static void parse_snapshot(const char *body)
 			if (fi == 5) g_prev_close = atof(tmp);     /* field 5 = prev close */
 			if (fi == 6) g_open = atof(tmp);           /* field 6 = open */
 			if (fi == 33) g_change_pct = atof(tmp);    /* field 33 = change % */
-			if (fi == 41) g_market_open = strstr(tmp, "Open") || strstr(tmp, "open");
+			if (fi == 41 && tmp[0]) g_market_open = strstr(tmp, "Open") || strstr(tmp, "open");
+			if (fi == 57 && tmp[0]) g_market_open = (strcmp(tmp, "ZS") == 0);  /* 美股 ZS=开市 */
 		} else if (idx < 255) tmp[idx++] = *p;
 		p++;
 	}
@@ -402,8 +413,10 @@ static void parse_snapshot(const char *body)
 static void fetch_snapshot(void)
 {
 	g_stock_buf_len = 0; g_stock_buf[0] = '\0';
+	char url[128];
+	snprintf(url, sizeof(url), "http://qt.gtimg.cn/q=%s", g_stocks[g_stock_idx].code);
 	esp_http_client_config_t cfg = {
-		.url = "http://qt.gtimg.cn/q=" STOCK_CODE,
+		.url = url,
 		.event_handler = stock_http_handler,
 		.timeout_ms = 5000,
 		.buffer_size = 2048,
@@ -414,12 +427,45 @@ static void fetch_snapshot(void)
 	esp_http_client_cleanup(cli);
 }
 
+/* 从 JSON 对象起始处提取指定字段的浮点值 */
+static float sina_extract(const char *p, const char *key)
+{
+	char buf[8]; snprintf(buf, sizeof(buf), "\"%s\":\"", key);
+	const char *v = strstr(p, buf);
+	return v ? (float)atof(v + strlen(buf)) : 0.0f;
+}
+
+/* 解析新浪美股 K 线 — 两遍扫描, 只取最后 KLINE_MAX 条 */
+static int parse_kline_us(void)
+{
+	int total = 0;
+	char *p = g_stock_buf;
+	while ((p = strstr(p, "\"d\":\"")) != NULL) { total++; p++; }
+
+	int skip = total - KLINE_MAX;
+	if (skip < 0) skip = 0;
+	p = g_stock_buf;
+	for (int i = 0; i < skip; i++) { p = strstr(p, "\"d\":\""); if (!p) break; p++; }
+
+	int cnt = 0;
+	while (cnt < KLINE_MAX && (p = strstr(p, "\"d\":\"")) != NULL) {
+		g_kline[cnt].c = sina_extract(p, "c");
+		g_kline[cnt].o = sina_extract(p, "o");
+		g_kline[cnt].h = sina_extract(p, "h");
+		g_kline[cnt].l = sina_extract(p, "l");
+		cnt++; p++;
+	}
+	return cnt;
+}
+
 /* 解析 K 线 — 手动提取, 不依赖 cJSON */
 static int parse_kline(void)
 {
 	char *p = strstr(g_stock_buf, "qfqday\":[");
+	int off = 9;
+	if (!p) { p = strstr(g_stock_buf, "\"day\":["); off = 7; }
 	if (!p) return 0;
-	p += 9;
+	p += off;
 
 	int cnt = 0;
 	while (cnt < KLINE_MAX && *p == '[') {
@@ -430,6 +476,7 @@ static int parse_kline(void)
 		line[li] = '\0';
 		for (int i = 0; i < li; i++) if (line[i] == '"' || line[i] == ',') line[i] = ' ';
 		sscanf(line, "[ %*s %f %f %f %f", &o, &c, &h, &l);
+		//
 		ESP_LOGI(TAG, "  parsed[%d] o=%.2f c=%.2f h=%.2f l=%.2f", cnt, o, c, h, l);
 		g_kline[cnt].o = o; g_kline[cnt].c = c;
 		g_kline[cnt].h = h; g_kline[cnt].l = l;
@@ -437,6 +484,7 @@ static int parse_kline(void)
 		p = strchr(p + 1, '[');
 		if (!p) break;
 	}
+	//
 	ESP_LOGI(TAG, "parse_kline: %d records, first close=%.2f last close=%.2f",
 		 cnt, cnt > 0 ? g_kline[0].c : 0.0f, cnt > 0 ? g_kline[cnt-1].c : 0.0f);
 	return cnt;
@@ -445,8 +493,16 @@ static int parse_kline(void)
 static void fetch_kline(int days)
 {
 	g_stock_buf_len = 0; g_stock_buf[0] = '\0';
-	char url[128];
-	snprintf(url, sizeof(url), "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=" STOCK_CODE ",day,,,%d,qfq", days > KLINE_MAX ? KLINE_MAX : days);
+	char url[256];
+	if (g_stocks[g_stock_idx].sina) {
+		/* 美股用新浪 API */
+		snprintf(url, sizeof(url), "https://stock.finance.sina.com.cn/usstock/api/json_v2.php/US_MinKService.getDailyK?symbol=%s&type=daily&num=%d",
+			 g_stocks[g_stock_idx].sina, days > KLINE_MAX ? KLINE_MAX : days);
+	} else {
+		/* A 股用腾讯财经 fqkline API */
+		snprintf(url, sizeof(url), "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s,day,,,%d,qfq",
+			 g_stocks[g_stock_idx].code, days > KLINE_MAX ? KLINE_MAX : days);
+	}
 	esp_http_client_config_t cfg = {
 		.url = url,
 		.event_handler = stock_http_handler,
@@ -458,11 +514,13 @@ static void fetch_kline(int days)
 	esp_http_client_set_header(cli, "User-Agent", "Mozilla/5.0");
 	esp_err_t err = esp_http_client_perform(cli);
 	int status = esp_http_client_get_status_code(cli);
+	//
 	ESP_LOGI(TAG, "K-line HTTP status=%d, buf len=%d, snippet: %.80s", status, g_stock_buf_len, g_stock_buf);
 	if (err == ESP_OK) {
-		g_kline_count = parse_kline();
+		g_kline_count = g_stocks[g_stock_idx].sina ? parse_kline_us() : parse_kline();
 	}
 	esp_http_client_cleanup(cli);
+	//
 	ESP_LOGI(TAG, "K-line: %d days fetched", g_kline_count);
 }
 
@@ -470,44 +528,45 @@ static void fetch_kline(int days)
 
 static void stock_update_chart(void)
 {
-	if (g_kline_count == 0 || !stock_series) return;
 	int view = g_stock_view;
 	int start = g_kline_count - view;
 	if (start < 0) start = 0;
 	int n = g_kline_count - start;
-	if (n <= 0) return;
+	float ymin = 0, ymax = 100;
 
-	/* 追加当前实时价格作为额外数据点 */
-	int total = n + 1;
-	float extra_close = g_price > 0 ? g_price : g_kline[g_kline_count-1].c;
-	float extra_high  = g_price > g_kline[g_kline_count-1].h ? g_price : g_kline[g_kline_count-1].h;
-	float extra_low   = g_price < g_kline[g_kline_count-1].l ? g_price : g_kline[g_kline_count-1].l;
+	if (g_kline_count > 0 && stock_series && n > 0) {
+		int total = n + 1;
+		float extra_close = g_price > 0 ? g_price : g_kline[g_kline_count-1].c;
+		float extra_high  = g_price > g_kline[g_kline_count-1].h ? g_price : g_kline[g_kline_count-1].h;
+		float extra_low   = g_price < g_kline[g_kline_count-1].l ? g_price : g_kline[g_kline_count-1].l;
 
-	float ymin = 999999, ymax = 0;
-	for (int i = start; i < g_kline_count; i++) {
-		if (g_kline[i].l < ymin) ymin = g_kline[i].l;
-		if (g_kline[i].h > ymax) ymax = g_kline[i].h;
+		ymin = 999999; ymax = 0;
+		for (int i = start; i < g_kline_count; i++) {
+			if (g_kline[i].l < ymin) ymin = g_kline[i].l;
+			if (g_kline[i].h > ymax) ymax = g_kline[i].h;
+		}
+		if (extra_low < ymin) ymin = extra_low;
+		if (extra_high > ymax) ymax = extra_high;
+
+		float pad = (ymax - ymin) * 0.05f;
+		lv_chart_set_point_count(stock_chart, total);
+		lv_chart_set_range(stock_chart, LV_CHART_AXIS_PRIMARY_Y, (int)(ymin - pad), (int)(ymax + pad));
+		lv_chart_set_div_line_count(stock_chart, 3, (total <= 8) ? (total - 1) : 9);
+
+		for (int i = 0; i < n; i++)
+			lv_chart_set_next_value(stock_chart, stock_series, (int)g_kline[start + i].c);
+		lv_chart_set_next_value(stock_chart, stock_series, (int)extra_close);
+		lv_chart_refresh(stock_chart);
 	}
-	if (extra_low < ymin) ymin = extra_low;
-	if (extra_high > ymax) ymax = extra_high;
 
-	float pad = (ymax - ymin) * 0.05f;
-	lv_chart_set_point_count(stock_chart, total);
-	lv_chart_set_range(stock_chart, LV_CHART_AXIS_PRIMARY_Y, (int)(ymin - pad), (int)(ymax + pad));
-	lv_chart_set_div_line_count(stock_chart, 3, (total <= 8) ? (total - 1) : 9);
-
-	for (int i = 0; i < n; i++)
-		lv_chart_set_next_value(stock_chart, stock_series, (int)g_kline[start + i].c);
-	lv_chart_set_next_value(stock_chart, stock_series, (int)extra_close);
-	lv_chart_refresh(stock_chart);
-
-	ESP_LOGI(TAG, "chart: view=%d data=%d total=%d price=%.2f extra=%.2f", view, n, total, g_price, extra_close);
-
-	/* 更新 Y 轴标签(从上到下: 高→低, 对齐 chart 网格线) */
+	/* 更新 Y 轴标签 */
 	char buf[16];
 	float yrange = (ymax - ymin) * 1.05f + 1;
 	for (int i = 0; i < 4; i++) {
-		snprintf(buf, sizeof(buf), "%.0f", ymin + yrange * (3 - i) / 3);
+		if (g_kline_count > 0)
+			snprintf(buf, sizeof(buf), "%.0f", ymin + yrange * (3 - i) / 3);
+		else
+			snprintf(buf, sizeof(buf), "--");
 		lv_label_set_text(stock_ylabels[i], buf);
 		lv_obj_align_to(stock_ylabels[i], stock_chart, LV_ALIGN_OUT_LEFT_MID, 10, -80 + i * 53);
 	}
@@ -522,7 +581,7 @@ static void stock_update_header(void)
 	bool up = g_change_pct >= 0;
 	char buf[128];
 	snprintf(buf, sizeof(buf), "%s  %.2f  %s%.2f%%  %s",
-		STOCK_CODE, g_price,
+		g_stocks[g_stock_idx].code, g_price,
 		up ? "^" : "v", g_change_pct,
 		g_market_open ? "Open" : "Closed");
 	lv_label_set_text(stock_header, buf);
@@ -534,13 +593,28 @@ static void stock_update_footer(void)
 {
 	if (!stock_footer) return;
 	char buf[64];
-	snprintf(buf, sizeof(buf), "O:%.2f  C:%.2f  Refresh:%ds", g_open, g_price, g_stock_refresh_s);
+	snprintf(buf, sizeof(buf), "O:%.2f  C:%.2f  [%2ds]", g_open, g_price, g_stock_refresh_s);
 	lv_label_set_text(stock_footer, buf);
 }
 
-static void on_stock_btn7(lv_event_t *e)  { g_stock_view = 7;  stock_update_chart(); }
-static void on_stock_btn30(lv_event_t *e) { g_stock_view = 30; stock_update_chart(); }
-static void on_stock_btn180(lv_event_t *e){ g_stock_view = 180; stock_update_chart(); }
+static void on_stock_btn7(lv_event_t *e)  { g_stock_view = 7;  g_stock_need_ui = true; }
+static void on_stock_btn30(lv_event_t *e) { g_stock_view = 30; g_stock_need_ui = true; }
+static void on_stock_btn180(lv_event_t *e){ g_stock_view = 180; g_stock_need_ui = true; }
+
+static void on_stock_next(lv_event_t *e)
+{
+	g_stock_idx = (g_stock_idx + 1) % (sizeof(g_stocks)/sizeof(g_stocks[0]));
+	ESP_LOGI(TAG, "Switch stock: idx=%d code=%s", g_stock_idx, g_stocks[g_stock_idx].code);
+	g_kline_count = 0;
+	g_stock_view = 7;
+	g_stock_refresh_s = 5;
+	g_stock_tick = xTaskGetTickCount();
+	lv_chart_set_point_count(stock_chart, 0);  /* 清除旧折线 */
+	lv_chart_refresh(stock_chart);
+	g_stock_kline_running = true;
+	g_stock_snap_running = true;
+	g_stock_need_ui = true;
+}
 
 static void create_stock_screen(void)
 {
@@ -550,21 +624,27 @@ static void create_stock_screen(void)
 	/* 左侧按钮 */
 	stock_btn7 = lv_button_create(scr_stock);
 	lv_obj_set_size(stock_btn7, 48, 48);
-	lv_obj_align(stock_btn7, LV_ALIGN_LEFT_MID, 4, -60);
+	lv_obj_align(stock_btn7, LV_ALIGN_LEFT_MID, 4, -55);
 	lv_obj_add_event_cb(stock_btn7, on_stock_btn7, LV_EVENT_CLICKED, NULL);
 	lv_obj_t *l7 = lv_label_create(stock_btn7); lv_label_set_text(l7, "7"); lv_obj_center(l7);
 
 	stock_btn30 = lv_button_create(scr_stock);
 	lv_obj_set_size(stock_btn30, 48, 48);
-	lv_obj_align(stock_btn30, LV_ALIGN_LEFT_MID, 4, 0);
+	lv_obj_align(stock_btn30, LV_ALIGN_LEFT_MID, 4, -5);
 	lv_obj_add_event_cb(stock_btn30, on_stock_btn30, LV_EVENT_CLICKED, NULL);
 	lv_obj_t *l30 = lv_label_create(stock_btn30); lv_label_set_text(l30, "30"); lv_obj_center(l30);
 
 	stock_btn180 = lv_button_create(scr_stock);
 	lv_obj_set_size(stock_btn180, 48, 48);
-	lv_obj_align(stock_btn180, LV_ALIGN_LEFT_MID, 4, 60);
+	lv_obj_align(stock_btn180, LV_ALIGN_LEFT_MID, 4, 45);
 	lv_obj_add_event_cb(stock_btn180, on_stock_btn180, LV_EVENT_CLICKED, NULL);
 	lv_obj_t *l180 = lv_label_create(stock_btn180); lv_label_set_text(l180, "180"); lv_obj_center(l180);
+
+	lv_obj_t *btn_next = lv_button_create(scr_stock);
+	lv_obj_set_size(btn_next, 48, 48);
+	lv_obj_align(btn_next, LV_ALIGN_LEFT_MID, 4, 95);
+	lv_obj_add_event_cb(btn_next, on_stock_next, LV_EVENT_CLICKED, NULL);
+	lv_obj_t *ln = lv_label_create(btn_next); lv_label_set_text(ln, ">>"); lv_obj_center(ln);
 
 	/* 上部信息栏 */
 	stock_header = lv_label_create(scr_stock);
@@ -579,8 +659,9 @@ static void create_stock_screen(void)
 	lv_obj_set_style_bg_color(stock_chart, lv_color_black(), LV_STATE_DEFAULT);
 	lv_obj_set_style_border_width(stock_chart, 0, LV_STATE_DEFAULT);
 	lv_chart_set_range(stock_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
-	lv_obj_set_style_line_color(stock_chart, lv_color_hex(0x00AAFF), LV_PART_ITEMS);
-	stock_series = lv_chart_add_series(stock_chart, lv_color_hex(0x00AAFF), LV_CHART_AXIS_PRIMARY_Y);
+	lv_obj_set_style_line_color(stock_chart, lv_color_hex(0xFFFFFF), LV_PART_ITEMS);
+	lv_obj_set_style_size(stock_chart, 0, 0, LV_PART_INDICATOR);
+	stock_series = lv_chart_add_series(stock_chart, lv_color_hex(0xFFFFFF), LV_CHART_AXIS_PRIMARY_Y);
 
 	/* Y 轴标签(左侧) */
 	for (int i = 0; i < 4; i++) {
@@ -616,7 +697,7 @@ static void on_continue_click(lv_event_t *e)
 		lv_scr_load(scr_stock);
 		g_stock_kline_running = true;
 		g_stock_snap_running = true;
-		g_stock_refresh_s = 30;
+		g_stock_refresh_s = 5;
 		g_stock_tick = xTaskGetTickCount();
 	}
 }
@@ -1018,7 +1099,7 @@ void app_main(void)
 			g_stock_refresh_s--;
 			g_stock_need_ui = true;
 			if (g_stock_refresh_s <= 0) {
-				g_stock_refresh_s = 30;
+				g_stock_refresh_s = 5;
 				g_stock_snap_running = true;
 			}
 		}
@@ -1124,8 +1205,7 @@ void app_main(void)
 			if (g_state == 8 && g_stock_need_ui) {
 				stock_update_header();
 				stock_update_footer();
-				if (g_kline_count > 0 && !g_stock_snap_running && !g_stock_kline_running)
-					stock_update_chart();
+				stock_update_chart();
 				g_stock_need_ui = false;
 			}
 			lvgl_port_unlock();
